@@ -1,0 +1,29 @@
+# Delphi compiled output
+*.dcu
+*.exe
+*.dll
+*.bpl
+*.bpi
+*.lib
+*.map
+*.dres
+*.rsm
+*.dat
+
+# IDE local/cache files
+*.dproj.local
+*.local
+*.identcache
+*.tvsconfig
+*.deployproj
+
+# IDE history folders
+__history/
+__recovery/
+Temp/
+
+# Build output folders
+Win32/
+Win64/
+Debug/
+Release/
