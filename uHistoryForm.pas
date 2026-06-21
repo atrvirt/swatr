@@ -76,7 +76,7 @@ var
 begin
   inherited CreateNew(nil);
   FPrevFgWnd := APrevFgWnd;
-  FIgnoreDeactivate := True; // stays True until first OnActivate
+  FIgnoreDeactivate := False;
   BuildUI;
   Reload;
   if lstItems.Count > 0 then

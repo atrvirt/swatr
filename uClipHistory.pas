@@ -139,7 +139,22 @@ begin
 end;
 
 procedure TClipHistory.PushBitmap(Bmp: TBitmap);
+var
+  I: Integer;
+  Old: TClipItem;
 begin
+  // Dedup by dimensions — move existing match to top instead of adding duplicate
+  for I := FList.Count - 1 downto 0 do
+  begin
+    Old := TClipItem(FList[I]);
+    if (Old.Kind = ckBitmap) and
+       (Old.Bmp.Width = Bmp.Width) and (Old.Bmp.Height = Bmp.Height) then
+    begin
+      Old.Free;
+      FList.Delete(I);
+      Break;
+    end;
+  end;
   while FList.Count >= MAX_CLIP_ITEMS do
   begin
     TClipItem(FList[0]).Free;
