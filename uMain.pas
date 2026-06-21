@@ -611,7 +611,13 @@ begin
   if IsClipboardFormatAvailable(CF_UNICODETEXT) then
   begin
     if ClipGetText(Txt) and (Txt <> '') then
-      ClipHistory.PushText(Txt);
+    begin
+      // Skip if identical to the most recent entry (some apps fire update twice)
+      if (ClipHistory.Count = 0) or
+         (ClipHistory[0].Kind <> ckText) or
+         (Trim(ClipHistory[0].Text) <> Trim(Txt)) then
+        ClipHistory.PushText(Txt);
+    end;
   end
   else if IsClipboardFormatAvailable(CF_BITMAP) or
           IsClipboardFormatAvailable(CF_DIB) then

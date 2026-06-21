@@ -119,12 +119,15 @@ procedure TClipHistory.PushText(const S: string);
 var
   I: Integer;
   Old: TClipItem;
+  Norm: string;
 begin
-  if Trim(S) = '' then Exit;
+  Norm := Trim(S);
+  if Norm = '' then Exit;
+  // Remove ALL existing entries with same trimmed text (any position)
   for I := FList.Count - 1 downto 0 do
   begin
     Old := TClipItem(FList[I]);
-    if (Old.Kind = ckText) and (Old.Text = S) then
+    if (Old.Kind = ckText) and (Trim(Old.Text) = Norm) then
     begin
       Old.Free;
       FList.Delete(I);
@@ -135,7 +138,7 @@ begin
     TClipItem(FList[0]).Free;
     FList.Delete(0);
   end;
-  FList.Add(TClipItem.CreateText(S));
+  FList.Add(TClipItem.CreateText(Norm));
 end;
 
 procedure TClipHistory.PushBitmap(Bmp: TBitmap);
