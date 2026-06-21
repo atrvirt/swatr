@@ -14,7 +14,7 @@ object frmMain: TfrmMain
   OnDestroy = FormDestroy
   TextHeight = 15
   object TrayIcon1: TTrayIcon
-    Hint = 'SwATR v1.2.0'
+    Hint = 'SwATR v1.3.0'
     PopupMenu = PopupMenu1
     Left = 16
     Top = 8

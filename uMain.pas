@@ -11,7 +11,7 @@ uses
   uConverter, System.Classes;
 
 const
-  APP_VERSION         = '1.2.0';
+  APP_VERSION         = '1.3.0';
   WM_CONVERT_LAST     = WM_USER + 10;
   WM_CONVERT_SELECTED = WM_USER + 11;
   WM_SWITCH_LAYOUT    = WM_USER + 12;
@@ -56,7 +56,7 @@ var
 implementation
 
 uses
-  Vcl.Clipbrd, Vcl.StdCtrls,
+  Vcl.Clipbrd, Vcl.StdCtrls, System.Win.Registry,
   uClipHistory,
   uHistoryForm;
 
@@ -808,14 +808,57 @@ begin
   TrayIcon1.Visible := False;
 end;
 
+const
+  AUTORUN_KEY  = 'Software\Microsoft\Windows\CurrentVersion\Run';
+  AUTORUN_NAME = 'SwATR';
+
+function IsAutoRunSet: Boolean;
+var
+  Reg: TRegistry;
+begin
+  Result := False;
+  Reg := TRegistry.Create(KEY_READ);
+  try
+    Reg.RootKey := HKEY_CURRENT_USER;
+    if Reg.OpenKeyReadOnly(AUTORUN_KEY) then
+      Result := Reg.ValueExists(AUTORUN_NAME);
+  finally
+    Reg.Free;
+  end;
+end;
+
+procedure SetAutoRun(Enable: Boolean);
+var
+  Reg: TRegistry;
+begin
+  Reg := TRegistry.Create(KEY_WRITE);
+  try
+    Reg.RootKey := HKEY_CURRENT_USER;
+    if Reg.OpenKey(AUTORUN_KEY, True) then
+    begin
+      if Enable then
+        Reg.WriteString(AUTORUN_NAME, '"' + ParamStr(0) + '"')
+      else if Reg.ValueExists(AUTORUN_NAME) then
+        Reg.DeleteValue(AUTORUN_NAME);
+    end;
+  finally
+    Reg.Free;
+  end;
+end;
+
 procedure ShowAbout;
 var
-  F:   TForm;
-  Img: TImage;
-  Ico: TIcon;
-  Lbl: TLabel;
-  Btn: TButton;
-  Sep: TBevel;
+  F:     TForm;
+  Img:   TImage;
+  Ico:   TIcon;
+  Lbl:   TLabel;
+  Btn:   TButton;
+  Sep:   TBevel;
+  Chk:   TCheckBox;
+  BgBmp: TBitmap;
+  BgImg: TImage;
+  Y, LR, LG, LB: Integer;
+  GT: Single;
 begin
   F := TForm.CreateNew(nil);
   try
@@ -823,9 +866,38 @@ begin
     F.BorderStyle  := bsDialog;
     F.Position     := poScreenCenter;
     F.ClientWidth  := 330;
-    F.ClientHeight := 220;
+    F.ClientHeight := 252;
     F.Font.Name    := 'Segoe UI';
     F.Font.Size    := 9;
+
+    // --- Watercolour gradient background (blue top → yellow bottom) ---
+    // Colours: soft Ukrainian-flag palette blended with white
+    //   Top    : RGB(160, 210, 250)  watercolour azure
+    //   Bottom : RGB(255, 242, 140)  watercolour golden
+    // Must be created FIRST so all other controls paint on top of it.
+    BgBmp := TBitmap.Create;
+    try
+      BgBmp.PixelFormat := pf24bit;
+      BgBmp.Width  := F.ClientWidth;
+      BgBmp.Height := F.ClientHeight;
+      for Y := 0 to F.ClientHeight - 1 do
+      begin
+        GT := Y / (F.ClientHeight - 1);
+        LR := Round(160 + (255 - 160) * GT);
+        LG := Round(210 + (242 - 210) * GT);
+        LB := Round(250 + (140 - 250) * GT);
+        BgBmp.Canvas.Pen.Color := RGB(LR, LG, LB);
+        BgBmp.Canvas.MoveTo(0, Y);
+        BgBmp.Canvas.LineTo(F.ClientWidth, Y);
+      end;
+      BgImg := TImage.Create(F);
+      BgImg.Parent  := F;
+      BgImg.Enabled := False;
+      BgImg.SetBounds(0, 0, F.ClientWidth, F.ClientHeight);
+      BgImg.Picture.Bitmap.Assign(BgBmp);
+    finally
+      BgBmp.Free;
+    end;
 
     // Icon 64×64
     Img := TImage.Create(F);
@@ -841,25 +913,28 @@ begin
 
     // Name + version
     Lbl := TLabel.Create(F);
-    Lbl.Parent     := F;
+    Lbl.Parent       := F;
     Lbl.SetBounds(96, 18, 220, 30);
-    Lbl.Caption    := 'SwATR v' + APP_VERSION;
-    Lbl.Font.Size  := 14;
-    Lbl.Font.Style := [fsBold];
+    Lbl.Caption      := 'SwATR v' + APP_VERSION;
+    Lbl.Font.Size    := 14;
+    Lbl.Font.Style   := [fsBold];
+    Lbl.Transparent  := True;
 
     // Author
     Lbl := TLabel.Create(F);
-    Lbl.Parent      := F;
+    Lbl.Parent       := F;
     Lbl.SetBounds(96, 54, 220, 18);
-    Lbl.Caption     := 'Andrii (ATR) Tarasenko';
-    Lbl.Font.Color  := clGrayText;
+    Lbl.Caption      := 'Andrii (ATR) Tarasenko';
+    Lbl.Font.Color   := $00664400;
+    Lbl.Transparent  := True;
 
     // Copyright
     Lbl := TLabel.Create(F);
-    Lbl.Parent     := F;
+    Lbl.Parent       := F;
     Lbl.SetBounds(96, 72, 220, 18);
-    Lbl.Caption    := #169 + ' 2026  MIT License';
-    Lbl.Font.Color := clGrayText;
+    Lbl.Caption      := #169 + ' 2026  MIT License';
+    Lbl.Font.Color   := $00664400;
+    Lbl.Transparent  := True;
 
     // Separator
     Sep := TBevel.Create(F);
@@ -869,23 +944,40 @@ begin
 
     // Hotkeys
     Lbl := TLabel.Create(F);
-    Lbl.Parent   := F;
+    Lbl.Parent      := F;
     Lbl.SetBounds(16, 106, F.ClientWidth - 32, 80);
+    Lbl.Transparent := True;
     Lbl.Caption  :=
       'Pause'#9#9'— ' + #1087#1077#1088#1077#1090#1074#1086#1088#1080#1090#1080 + ' ' + #1085#1072#1073#1088#1072#1085#1077 + #13#10 +
       'Shift+Pause  — ' + #1087#1077#1088#1077#1090#1074#1086#1088#1080#1090#1080 + ' ' + #1074#1080#1076#1110#1083#1077#1085#1077 + #13#10 +
       'RCtrl'#9#9'— ' + #1079#1084#1110#1085#1080#1090#1080 + ' ' + #1088#1086#1079#1082#1083#1072#1076#1082#1091 + #13#10 +
       'Ctrl+`'#9#9'— ' + #1110#1089#1090#1086#1088#1110#1103 + ' ' + #1073#1091#1092#1077#1088#1072 + ' ' + #1086#1073#1084#1110#1085#1091;
 
+    // Separator 2
+    Sep := TBevel.Create(F);
+    Sep.Parent := F;
+    Sep.SetBounds(12, 186, F.ClientWidth - 24, 2);
+    Sep.Shape  := bsTopLine;
+
+    // Autorun checkbox
+    // Caption: "Запускати при старті Windows"
+    Chk := TCheckBox.Create(F);
+    Chk.Parent   := F;
+    Chk.SetBounds(12, 194, F.ClientWidth - 24, 20);
+    Chk.Caption  := #1047#1072#1087#1091#1089#1082#1072#1090#1080 + ' ' +
+                    #1087#1088#1080 + ' ' + #1089#1090#1072#1088#1090#1110 + ' Windows';
+    Chk.Checked  := IsAutoRunSet;
+
     // OK button
     Btn := TButton.Create(F);
     Btn.Parent      := F;
-    Btn.SetBounds((F.ClientWidth - 80) div 2, F.ClientHeight - 40, 80, 28);
+    Btn.SetBounds((F.ClientWidth - 80) div 2, F.ClientHeight - 36, 80, 28);
     Btn.Caption     := 'OK';
     Btn.Default     := True;
     Btn.ModalResult := mrOk;
 
-    F.ShowModal;
+    if F.ShowModal = mrOk then
+      SetAutoRun(Chk.Checked);
   finally
     F.Free;
   end;
