@@ -1,3 +1,5 @@
+// SwATR — UA<->EN keyboard layout character mapping
+// Author : Andrii (ATR) Tarasenko
 unit uConverter;
 
 interface

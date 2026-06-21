@@ -14,7 +14,7 @@ object frmMain: TfrmMain
   OnDestroy = FormDestroy
   TextHeight = 15
   object TrayIcon1: TTrayIcon
-    Hint = 'SwATR'
+    Hint = 'SwATR v1.2.0'
     PopupMenu = PopupMenu1
     Left = 16
     Top = 8
@@ -23,14 +23,14 @@ object frmMain: TfrmMain
     Left = 16
     Top = 56
     object miAbout: TMenuItem
-      Caption = 'Pro SwATR'
+      Caption = #1055#1088#1086' SwATR'
       OnClick = miAboutClick
     end
     object N1: TMenuItem
       Caption = '-'
     end
     object miExit: TMenuItem
-      Caption = 'Vyhid'
+      Caption = #1042#1080#1093#1110#1076
       OnClick = miExitClick
     end
   end

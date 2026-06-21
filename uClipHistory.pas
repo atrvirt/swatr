@@ -1,3 +1,5 @@
+// SwATR — clipboard history data model
+// Author : Andrii (ATR) Tarasenko
 unit uClipHistory;
 
 interface

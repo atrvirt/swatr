@@ -1,3 +1,6 @@
+// SwATR — keyboard layout switcher for Windows
+// Author : Andrii (ATR) Tarasenko
+// License: MIT
 unit uMain;
 
 interface
@@ -8,6 +11,7 @@ uses
   uConverter, System.Classes;
 
 const
+  APP_VERSION         = '1.2.0';
   WM_CONVERT_LAST     = WM_USER + 10;
   WM_CONVERT_SELECTED = WM_USER + 11;
   WM_SWITCH_LAYOUT    = WM_USER + 12;
@@ -52,7 +56,7 @@ var
 implementation
 
 uses
-  Vcl.Clipbrd,
+  Vcl.Clipbrd, Vcl.StdCtrls,
   uClipHistory,
   uHistoryForm;
 
@@ -94,6 +98,69 @@ begin
     $0407: Result := 'DE';
     $0415: Result := 'PL';
     else   Result := IntToHex(LangID, 4);
+  end;
+end;
+
+// -----------------------------------------------------------------------
+// Icon factory — shared by tray (dynamic) and app / About (static logo)
+// -----------------------------------------------------------------------
+
+// Static SwATR logo: dark bg, 'UA' yellow top half, 'EN' blue bottom half
+function CreateSwAtrIcon(ASize: Integer): HICON;
+var
+  Bmp, Msk: TBitmap;
+  Ii: TIconInfo;
+  C: TCanvas;
+  Half, TW, TH: Integer;
+begin
+  Result := 0;
+  Bmp := TBitmap.Create;
+  Msk := TBitmap.Create;
+  try
+    Bmp.PixelFormat := pf24bit;
+    Bmp.Width  := ASize;
+    Bmp.Height := ASize;
+    C := Bmp.Canvas;
+    C.Brush.Color := $00222222;
+    C.FillRect(Rect(0, 0, ASize, ASize));
+
+    Half := ASize div 2;
+    SetBkMode(C.Handle, TRANSPARENT);
+    C.Font.Name  := 'Arial';
+    C.Font.Style := [fsBold];
+
+    // Top half: 'UA' in yellow
+    C.Font.Height := -(Half - 1);
+    C.Font.Color  := $0000FFFF;
+    TW := C.TextWidth('UA');
+    TH := C.TextHeight('UA');
+    C.TextOut((ASize - TW) div 2, (Half - TH) div 2, 'UA');
+
+    // Bottom half: 'EN' in blue
+    C.Font.Color := $00FF8800;
+    TW := C.TextWidth('EN');
+    TH := C.TextHeight('EN');
+    C.TextOut((ASize - TW) div 2, Half + (Half - TH) div 2, 'EN');
+
+    // Thin divider
+    C.Pen.Color := $00666666;
+    C.MoveTo(ASize div 4,     Half);
+    C.LineTo(ASize * 3 div 4, Half);
+
+    Msk.PixelFormat := pf1bit;
+    Msk.Width  := ASize;
+    Msk.Height := ASize;
+    Msk.Canvas.Brush.Color := clBlack;
+    Msk.Canvas.FillRect(Rect(0, 0, ASize, ASize));
+
+    ZeroMemory(@Ii, SizeOf(Ii));
+    Ii.fIcon    := True;
+    Ii.hbmMask  := Msk.Handle;
+    Ii.hbmColor := Bmp.Handle;
+    Result := CreateIconIndirect(Ii);
+  finally
+    Bmp.Free;
+    Msk.Free;
   end;
 end;
 
@@ -156,9 +223,9 @@ begin
     Msk.Free;
   end;
 
-  // Tooltip: show layout name
+  // Tooltip: show layout name + version
   TrayIcon1.Hint :=
-    'SwATR  [' + Name + ']' + #13#10 +
+    'SwATR v' + APP_VERSION + '  [' + Name + ']' + #13#10 +
     'Pause'#9'     - ' + #1087#1077#1088#1077#1090#1074#1086#1088#1080#1090#1080 + ' ' + #1085#1072#1073#1088#1072#1085#1077 + #13#10 +
     'Shift+Pause - ' + #1090#1077#1082#1089#1090 + #13#10 +
     'RCtrl'#9'     - ' + #1079#1084#1110#1085#1080#1090#1080 + ' ' + #1088#1086#1079#1082#1083#1072#1076#1082#1091 + #13#10 +
@@ -686,7 +753,8 @@ end;
 
 procedure TfrmMain.FormCreate(Sender: TObject);
 var
-  Tmr: TTimer;
+  Tmr:    TTimer;
+  AppIco: TIcon;
 begin
   if not InitSession then
   begin
@@ -699,6 +767,15 @@ begin
   ShowWindow(Application.Handle, SW_HIDE);
   SetWindowLong(Application.Handle, GWL_EXSTYLE,
     GetWindowLong(Application.Handle, GWL_EXSTYLE) or WS_EX_TOOLWINDOW);
+
+  // Set application icon (About dialog title bar, Alt+Tab)
+  AppIco := TIcon.Create;
+  try
+    AppIco.Handle := CreateSwAtrIcon(32);
+    Application.Icon.Assign(AppIco);
+  finally
+    AppIco.Free;
+  end;
 
   FCurrentHkl := GetFgHkl;
   UpdateTrayIcon;
@@ -731,16 +808,92 @@ begin
   TrayIcon1.Visible := False;
 end;
 
+procedure ShowAbout;
+var
+  F:   TForm;
+  Img: TImage;
+  Ico: TIcon;
+  Lbl: TLabel;
+  Btn: TButton;
+  Sep: TBevel;
+begin
+  F := TForm.CreateNew(nil);
+  try
+    F.Caption      := #1055#1088#1086 + ' SwATR';
+    F.BorderStyle  := bsDialog;
+    F.Position     := poScreenCenter;
+    F.ClientWidth  := 330;
+    F.ClientHeight := 220;
+    F.Font.Name    := 'Segoe UI';
+    F.Font.Size    := 9;
+
+    // Icon 64×64
+    Img := TImage.Create(F);
+    Img.Parent := F;
+    Img.SetBounds(16, 16, 64, 64);
+    Ico := TIcon.Create;
+    try
+      Ico.Handle := CreateSwAtrIcon(64);
+      Img.Picture.Icon.Assign(Ico);
+    finally
+      Ico.Free;
+    end;
+
+    // Name + version
+    Lbl := TLabel.Create(F);
+    Lbl.Parent     := F;
+    Lbl.SetBounds(96, 18, 220, 30);
+    Lbl.Caption    := 'SwATR v' + APP_VERSION;
+    Lbl.Font.Size  := 14;
+    Lbl.Font.Style := [fsBold];
+
+    // Author
+    Lbl := TLabel.Create(F);
+    Lbl.Parent      := F;
+    Lbl.SetBounds(96, 54, 220, 18);
+    Lbl.Caption     := 'Andrii (ATR) Tarasenko';
+    Lbl.Font.Color  := clGrayText;
+
+    // Copyright
+    Lbl := TLabel.Create(F);
+    Lbl.Parent     := F;
+    Lbl.SetBounds(96, 72, 220, 18);
+    Lbl.Caption    := #169 + ' 2026  MIT License';
+    Lbl.Font.Color := clGrayText;
+
+    // Separator
+    Sep := TBevel.Create(F);
+    Sep.Parent := F;
+    Sep.SetBounds(12, 96, F.ClientWidth - 24, 2);
+    Sep.Shape  := bsTopLine;
+
+    // Hotkeys
+    Lbl := TLabel.Create(F);
+    Lbl.Parent   := F;
+    Lbl.SetBounds(16, 106, F.ClientWidth - 32, 80);
+    Lbl.Caption  :=
+      'Pause'#9#9'— ' + #1087#1077#1088#1077#1090#1074#1086#1088#1080#1090#1080 + ' ' + #1085#1072#1073#1088#1072#1085#1077 + #13#10 +
+      'Shift+Pause  — ' + #1087#1077#1088#1077#1090#1074#1086#1088#1080#1090#1080 + ' ' + #1074#1080#1076#1110#1083#1077#1085#1077 + #13#10 +
+      'RCtrl'#9#9'— ' + #1079#1084#1110#1085#1080#1090#1080 + ' ' + #1088#1086#1079#1082#1083#1072#1076#1082#1091 + #13#10 +
+      'Ctrl+`'#9#9'— ' + #1110#1089#1090#1086#1088#1110#1103 + ' ' + #1073#1091#1092#1077#1088#1072 + ' ' + #1086#1073#1084#1110#1085#1091;
+
+    // OK button
+    Btn := TButton.Create(F);
+    Btn.Parent      := F;
+    Btn.SetBounds((F.ClientWidth - 80) div 2, F.ClientHeight - 40, 80, 28);
+    Btn.Caption     := 'OK';
+    Btn.Default     := True;
+    Btn.ModalResult := mrOk;
+
+    F.ShowModal;
+  finally
+    F.Free;
+  end;
+end;
+
 procedure TfrmMain.miAboutClick(Sender: TObject);
 begin
-  MessageBox(Handle,
-    PChar('SwATR v1.0'#13#10#13#10 +
-      'Pause'#9'- ' +
-      #1087#1077#1088#1077#1090#1074#1086#1088#1080#1090#1080 + ' ' + #1085#1072#1073#1088#1072#1085#1077 + #13#10 +
-      'Shift+Pause - ' +
-      #1087#1077#1088#1077#1090#1074#1086#1088#1080#1090#1080 + ' ' + #1074#1080#1076#1110#1083#1077#1085#1077 + #13#10 +
-      'RCtrl'#9'- ' + #1079#1084#1110#1085#1080#1090#1080 + ' ' + #1088#1086#1079#1082#1083#1072#1076#1082#1091),
-    'SwATR', MB_OK or MB_ICONINFORMATION);
+  ShowAbout;
 end;
 
 procedure TfrmMain.miExitClick(Sender: TObject);

@@ -1,6 +1,6 @@
+// SwATR — clipboard history popup form (no DFM)
+// Author : Andrii (ATR) Tarasenko
 unit uHistoryForm;
-
-// Clipboard history popup — created entirely in code (no DFM)
 
 interface
 
