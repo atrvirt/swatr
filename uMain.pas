@@ -58,7 +58,8 @@ implementation
 uses
   Vcl.Clipbrd, Vcl.StdCtrls, System.Win.Registry,
   uClipHistory,
-  uHistoryForm;
+  uHistoryForm,
+  uToastForm;
 
 {$R *.dfm}
 
@@ -573,9 +574,7 @@ begin
     else
       SwitchFgToLang($0409);  // English (US)
 
-    TrayIcon1.BalloonTitle := 'SwATR';
-    TrayIcon1.BalloonHint  := Buf + ' '#$2192' ' + Conv;
-    TrayIcon1.ShowBalloonHint;
+    ShowToast(Buf + ' '#$2192' ' + Conv);
   finally
     Converting := False;
   end;
@@ -699,12 +698,9 @@ begin
     else
       SwitchFgToLang($0409);
 
-    TrayIcon1.BalloonTitle := 'SwATR';
-    TrayIcon1.BalloonHint  :=
-      IntToStr(Length(Sel)) + ' ' +
+    ShowToast(IntToStr(Length(Sel)) + ' ' +
       #1089#1080#1084#1074#1086#1083#1110#1074 + ' ' +
-      #1087#1077#1088#1077#1090#1074#1086#1088#1077#1085#1086;
-    TrayIcon1.ShowBalloonHint;
+      #1087#1077#1088#1077#1090#1074#1086#1088#1077#1085#1086);
   finally
     Converting := False;
   end;

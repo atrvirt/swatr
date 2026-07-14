@@ -5,7 +5,8 @@ uses
   uMain      in 'uMain.pas' {frmMain},
   uConverter in 'uConverter.pas',
   uClipHistory in 'uClipHistory.pas',
-  uHistoryForm in 'uHistoryForm.pas';
+  uHistoryForm in 'uHistoryForm.pas',
+  uToastForm in 'uToastForm.pas';
 
 {$R *.res}
 
