@@ -350,7 +350,9 @@ begin
   // state, which in a LL hook is SwATR's thread — Shift is not reflected there.
   ZeroMemory(@KS, SizeOf(KS));
   if (GetAsyncKeyState(VK_SHIFT)   and $8000) <> 0 then KS[VK_SHIFT]   := $80;
-  if (GetAsyncKeyState(VK_CAPITAL) and $0001) <> 0 then KS[VK_CAPITAL] := $01;
+  // Toggle state: low bit of GetKeyState. GetAsyncKeyState's low bit is
+  // "pressed since last call", not the toggle.
+  if (GetKeyState(VK_CAPITAL) and 1) <> 0 then KS[VK_CAPITAL] := $01;
   if ToUnicodeEx(vk, scan, KS, Buf, 4, 0, GetFgHkl) = 1 then
     Result := Buf[0];
 end;
