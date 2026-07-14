@@ -158,6 +158,7 @@
         <DCCReference Include="uConverter.pas"/>
         <DCCReference Include="uClipHistory.pas"/>
         <DCCReference Include="uHistoryForm.pas"/>
+        <DCCReference Include="uToastForm.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
         </BuildConfiguration>

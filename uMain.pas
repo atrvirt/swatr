@@ -11,7 +11,7 @@ uses
   uConverter, System.Classes;
 
 const
-  APP_VERSION         = '1.3.0';
+  APP_VERSION         = '1.3.1';
   WM_CONVERT_LAST     = WM_USER + 10;
   WM_CONVERT_SELECTED = WM_USER + 11;
   WM_SWITCH_LAYOUT    = WM_USER + 12;
