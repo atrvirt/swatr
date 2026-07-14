@@ -70,6 +70,8 @@ var
   HookHandle:   HHOOK;
   KeyBuffer:    string;
   RCtrlDown:    Boolean;
+  Converting:   Boolean; // a conversion is in progress — drop re-triggers
+  PauseDown:    Boolean; // Pause held — ignore auto-repeat keydowns
 
 // -----------------------------------------------------------------------
 // Layout helpers
@@ -453,6 +455,16 @@ begin
     Exit;
   end;
 
+  // Pause keyup: reset the first-press latch (keydown is consumed below,
+  // so consume the matching keyup as well)
+  if ((wParam = WM_KEYUP) or (wParam = WM_SYSKEYUP)) and
+     (KHS^.vkCode = VK_PAUSE) then
+  begin
+    PauseDown := False;
+    Result := 1;
+    Exit;
+  end;
+
   if (wParam = WM_KEYDOWN) or (wParam = WM_SYSKEYDOWN) then
   begin
     IsCtrl := (GetAsyncKeyState(VK_CONTROL) and $8000) <> 0;
@@ -470,10 +482,19 @@ begin
     // ---- Pause / Shift+Pause ----
     if KHS^.vkCode = VK_PAUSE then
     begin
-      if (GetAsyncKeyState(VK_SHIFT) and $8000) <> 0 then
-        PostMessage(frmMain.Handle, WM_CONVERT_SELECTED, 0, 0)
-      else
-        PostMessage(frmMain.Handle, WM_CONVERT_LAST, 0, 0);
+      // Trigger only on the first keydown (holding Pause auto-repeats)
+      // and only when no conversion is already running.
+      if not PauseDown then
+      begin
+        PauseDown := True;
+        if not Converting then
+        begin
+          if (GetAsyncKeyState(VK_SHIFT) and $8000) <> 0 then
+            PostMessage(frmMain.Handle, WM_CONVERT_SELECTED, 0, 0)
+          else
+            PostMessage(frmMain.Handle, WM_CONVERT_LAST, 0, 0);
+        end;
+      end;
       Result := 1;
       Exit;
     end;
@@ -529,28 +550,35 @@ var
   Inp: array of TInput;
   Idx: Integer;
 begin
-  Buf := KeyBuffer;
-  KeyBuffer := '';
-  if (Buf = '') or (ConvertText(Buf) = Buf) then Exit;
+  if Converting then Exit;
+  Converting := True;
+  try
+    Buf := KeyBuffer;
+    KeyBuffer := '';
+    if Buf = '' then Exit;
+    Conv := ConvertText(Buf);
+    if Conv = Buf then Exit;
 
-  Conv := ConvertText(Buf);
-  SetLength(Inp, (Length(Buf) + Length(Conv)) * 2);
-  Idx := 0;
-  FillBackspaces(Length(Buf), Inp, Idx);
-  FillUnicodeText(Conv, Inp, Idx);
-  SendInput(Idx, Inp[0], SizeOf(TInput));
+    SetLength(Inp, (Length(Buf) + Length(Conv)) * 2);
+    Idx := 0;
+    FillBackspaces(Length(Buf), Inp, Idx);
+    FillUnicodeText(Conv, Inp, Idx);
+    SendInput(Idx, Inp[0], SizeOf(TInput));
 
-  KeyBuffer := Conv;
+    KeyBuffer := Conv;
 
-  // Switch layout to match the converted text
-  if IsUkrText(Conv) then
-    SwitchFgToLang($0422)   // Ukrainian
-  else
-    SwitchFgToLang($0409);  // English (US)
+    // Switch layout to match the converted text
+    if IsUkrText(Conv) then
+      SwitchFgToLang($0422)   // Ukrainian
+    else
+      SwitchFgToLang($0409);  // English (US)
 
-  TrayIcon1.BalloonTitle := 'SwATR';
-  TrayIcon1.BalloonHint  := Buf + ' '#$2192' ' + Conv;
-  TrayIcon1.ShowBalloonHint;
+    TrayIcon1.BalloonTitle := 'SwATR';
+    TrayIcon1.BalloonHint  := Buf + ' '#$2192' ' + Conv;
+    TrayIcon1.ShowBalloonHint;
+  finally
+    Converting := False;
+  end;
 end;
 
 // ---- Direct WinAPI clipboard helpers (no VCL, with retry on EACCES) ----
@@ -640,38 +668,46 @@ procedure TfrmMain.WMConvertSelected(var Msg: TMessage);
 var
   Sel, Conv: string;
 begin
-  KeyBuffer := '';
+  if Converting then Exit;
+  Converting := True;
+  try
+    KeyBuffer := '';
 
-  // Shift is still physically held from Shift+Pause — release it
-  // so that Ctrl+C is not seen as Ctrl+Shift+C by the target app
-  ReleaseShift;
-  Sleep(30);
+    // Wait for the user to physically release Shift (held from
+    // Shift+Pause); if still held after 400 ms, release it synthetically
+    // so Ctrl+C is not seen as Ctrl+Shift+C by the target app.
+    WaitShiftUp(400);
+    ReleaseShift;
+    WaitPump(30);
 
-  ClipSetText('');           // clear so we can detect if copy succeeded
-  SendCtrlKey(Ord('C'));
-  Sleep(250);               // wait for target app to write to clipboard
+    ClipSetText('');           // clear so we can detect if copy succeeded
+    SendCtrlKey(Ord('C'));
+    WaitPump(250);             // wait for target app to write to clipboard
 
-  if not ClipGetText(Sel) then Exit;
-  if Sel = '' then Exit;
+    if not ClipGetText(Sel) then Exit;
+    if Sel = '' then Exit;
 
-  Conv := ConvertText(Sel);
-  if Conv = Sel then Exit;
+    Conv := ConvertText(Sel);
+    if Conv = Sel then Exit;
 
-  ClipSetText(Conv);
-  SendCtrlKey(Ord('V'));
+    ClipSetText(Conv);
+    SendCtrlKey(Ord('V'));
 
-  // Switch layout to match the converted text
-  if IsUkrText(Conv) then
-    SwitchFgToLang($0422)
-  else
-    SwitchFgToLang($0409);
+    // Switch layout to match the converted text
+    if IsUkrText(Conv) then
+      SwitchFgToLang($0422)
+    else
+      SwitchFgToLang($0409);
 
-  TrayIcon1.BalloonTitle := 'SwATR';
-  TrayIcon1.BalloonHint  :=
-    IntToStr(Length(Sel)) + ' ' +
-    #1089#1080#1084#1074#1086#1083#1110#1074 + ' ' +
-    #1087#1077#1088#1077#1090#1074#1086#1088#1077#1085#1086;
-  TrayIcon1.ShowBalloonHint;
+    TrayIcon1.BalloonTitle := 'SwATR';
+    TrayIcon1.BalloonHint  :=
+      IntToStr(Length(Sel)) + ' ' +
+      #1089#1080#1084#1074#1086#1083#1110#1074 + ' ' +
+      #1087#1077#1088#1077#1090#1074#1086#1088#1077#1085#1086;
+    TrayIcon1.ShowBalloonHint;
+  finally
+    Converting := False;
+  end;
 end;
 
 // Switch foreground window to a specific language (by LANGID, e.g. $0422=UA, $0409=EN)
