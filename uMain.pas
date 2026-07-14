@@ -252,6 +252,50 @@ end;
 // Input helpers
 // -----------------------------------------------------------------------
 
+// Waits ~Ms milliseconds WITHOUT blocking this thread's message pump.
+// The WH_KEYBOARD_LL hook is serviced by this thread: a plain Sleep here
+// makes Windows hold every keystroke system-wide until the hook timeout,
+// then bypass (and eventually silently remove) the hook.
+procedure WaitPump(Ms: Cardinal);
+var
+  Deadline: UInt64;
+  M: TMsg;
+begin
+  Deadline := GetTickCount64 + Ms;
+  repeat
+    while PeekMessage(M, 0, 0, 0, PM_REMOVE) do
+    begin
+      if M.message = WM_QUIT then
+      begin
+        PostQuitMessage(Integer(M.wParam));
+        Exit;
+      end;
+      TranslateMessage(M);
+      DispatchMessage(M);
+    end;
+    if GetTickCount64 >= Deadline then
+      Break;
+    MsgWaitForMultipleObjects(0, Pointer(nil)^, False,
+      DWORD(Deadline - GetTickCount64), QS_ALLINPUT);
+  until False;
+end;
+
+// Wait until the physical Shift keys are released, up to TimeoutMs.
+// Proceeds anyway on timeout (worst case equals current behavior).
+procedure WaitShiftUp(TimeoutMs: Cardinal);
+var
+  Deadline: UInt64;
+begin
+  Deadline := GetTickCount64 + TimeoutMs;
+  while ((GetAsyncKeyState(VK_LSHIFT) and $8000) <> 0) or
+        ((GetAsyncKeyState(VK_RSHIFT) and $8000) <> 0) do
+  begin
+    if GetTickCount64 >= Deadline then
+      Break;
+    WaitPump(10);
+  end;
+end;
+
 procedure FillBackspaces(Count: Integer; var Inp: array of TInput; var Idx: Integer);
 var
   I: Integer;
@@ -293,18 +337,30 @@ begin
   end;
 end;
 
+// Sends Ctrl+<VK> with the modifier spaced out in time. A single 4-event
+// batch can reach the target app with Ctrl no longer seen as held when
+// hook processing is delayed — the app then types the bare letter.
 procedure SendCtrlKey(VK: WORD);
-var
-  Inp: array[0..3] of TInput;
+
+  procedure SendOne(AVk: WORD; AFlags: DWORD);
+  var
+    Inp: TInput;
+  begin
+    FillChar(Inp, SizeOf(Inp), 0);
+    Inp.Itype := INPUT_KEYBOARD;
+    Inp.ki.wVk := AVk;
+    Inp.ki.dwFlags := AFlags;
+    Inp.ki.dwExtraInfo := SWATTR_MAGIC;
+    SendInput(1, Inp, SizeOf(TInput));
+  end;
+
 begin
-  FillChar(Inp, SizeOf(Inp), 0);
-  Inp[0].Itype := INPUT_KEYBOARD; Inp[0].ki.wVk := VK_CONTROL; Inp[0].ki.dwExtraInfo := SWATTR_MAGIC;
-  Inp[1].Itype := INPUT_KEYBOARD; Inp[1].ki.wVk := VK;          Inp[1].ki.dwExtraInfo := SWATTR_MAGIC;
-  Inp[2].Itype := INPUT_KEYBOARD; Inp[2].ki.wVk := VK;
-    Inp[2].ki.dwFlags := KEYEVENTF_KEYUP;  Inp[2].ki.dwExtraInfo := SWATTR_MAGIC;
-  Inp[3].Itype := INPUT_KEYBOARD; Inp[3].ki.wVk := VK_CONTROL;
-    Inp[3].ki.dwFlags := KEYEVENTF_KEYUP;  Inp[3].ki.dwExtraInfo := SWATTR_MAGIC;
-  SendInput(4, Inp[0], SizeOf(TInput));
+  SendOne(VK_CONTROL, 0);
+  WaitPump(20);
+  SendOne(VK, 0);
+  SendOne(VK, KEYEVENTF_KEYUP);
+  WaitPump(20);
+  SendOne(VK_CONTROL, KEYEVENTF_KEYUP);
 end;
 
 // Release any physically-held Shift keys so Ctrl+C arrives without Shift
@@ -532,7 +588,7 @@ begin
       end;
       Exit; // opened OK — don't retry even if empty
     end;
-    Sleep(30); // clipboard busy — wait and retry
+    WaitPump(30); // clipboard busy — wait and retry
   end;
 end;
 
@@ -575,7 +631,7 @@ begin
       end;
       Exit;
     end;
-    Sleep(30);
+    WaitPump(30);
   end;
 end;
 
