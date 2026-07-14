@@ -1,4 +1,4 @@
-// SwATR — keyboard layout switcher for Windows
+﻿// SwATR — keyboard layout switcher for Windows
 // Author : Andrii (ATR) Tarasenko
 // License: MIT
 unit uMain;
@@ -346,8 +346,12 @@ var
   Buf: array[0..3] of WideChar;
 begin
   Result := #0;
-  GetKeyboardState(KS);
-  if ToUnicodeEx(vk, scan, KS, Buf, 4, 0, GetKeyboardLayout(0)) = 1 then
+  // Build KS from async state: GetKeyboardState reads the calling thread's
+  // state, which in a LL hook is SwATR's thread — Shift is not reflected there.
+  ZeroMemory(@KS, SizeOf(KS));
+  if (GetAsyncKeyState(VK_SHIFT)   and $8000) <> 0 then KS[VK_SHIFT]   := $80;
+  if (GetAsyncKeyState(VK_CAPITAL) and $0001) <> 0 then KS[VK_CAPITAL] := $01;
+  if ToUnicodeEx(vk, scan, KS, Buf, 4, 0, GetFgHkl) = 1 then
     Result := Buf[0];
 end;
 
@@ -617,12 +621,15 @@ end;
 procedure SwitchFgToLang(LangID: WORD);
 var
   FgWnd:   HWND;
+  FgTid:   DWORD;
+  OurTid:  DWORD;
   Buf:     array[0..31] of HKL;
   Cnt, I:  Integer;
   Target:  HKL;
 begin
   FgWnd := GetForegroundWindow;
   if FgWnd = 0 then Exit;
+  FgTid := GetWindowThreadProcessId(FgWnd, nil);
 
   Cnt := GetKeyboardLayoutList(32, Buf[0]);
   Target := 0;
@@ -633,8 +640,17 @@ begin
       Break;
     end;
 
-  if Target <> 0 then
-    PostMessage(FgWnd, WM_INPUTLANGCHANGEREQUEST, 0, LPARAM(Target));
+  if Target = 0 then Exit;
+
+  // AttachThreadInput lets ActivateKeyboardLayout take effect in the target thread.
+  // PostMessage(WM_INPUTLANGCHANGEREQUEST) is ignored by many apps that don't
+  // forward it to DefWindowProc.
+  OurTid := GetCurrentThreadId;
+  if OurTid <> FgTid then
+    AttachThreadInput(OurTid, FgTid, True);
+  ActivateKeyboardLayout(Target, 0);
+  if OurTid <> FgTid then
+    AttachThreadInput(OurTid, FgTid, False);
 end;
 
 // Right Ctrl — cycle to next installed keyboard layout
