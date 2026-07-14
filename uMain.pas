@@ -717,15 +717,12 @@ end;
 procedure SwitchFgToLang(LangID: WORD);
 var
   FgWnd:   HWND;
-  FgTid:   DWORD;
-  OurTid:  DWORD;
   Buf:     array[0..31] of HKL;
   Cnt, I:  Integer;
   Target:  HKL;
 begin
   FgWnd := GetForegroundWindow;
   if FgWnd = 0 then Exit;
-  FgTid := GetWindowThreadProcessId(FgWnd, nil);
 
   Cnt := GetKeyboardLayoutList(32, Buf[0]);
   Target := 0;
@@ -738,15 +735,11 @@ begin
 
   if Target = 0 then Exit;
 
-  // AttachThreadInput lets ActivateKeyboardLayout take effect in the target thread.
-  // PostMessage(WM_INPUTLANGCHANGEREQUEST) is ignored by many apps that don't
-  // forward it to DefWindowProc.
-  OurTid := GetCurrentThreadId;
-  if OurTid <> FgTid then
-    AttachThreadInput(OurTid, FgTid, True);
-  ActivateKeyboardLayout(Target, 0);
-  if OurTid <> FgTid then
-    AttachThreadInput(OurTid, FgTid, False);
+  // Same mechanism as WMSwitchLayout (RCtrl): DefWindowProc handles
+  // WM_INPUTLANGCHANGEREQUEST by activating the layout in the target thread.
+  // ActivateKeyboardLayout only affects the CALLING thread even with
+  // AttachThreadInput (layout is per-thread state, not queue state).
+  PostMessage(FgWnd, WM_INPUTLANGCHANGEREQUEST, 0, LPARAM(Target));
 end;
 
 // Right Ctrl — cycle to next installed keyboard layout
