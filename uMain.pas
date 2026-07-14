@@ -255,6 +255,10 @@ end;
 // Input helpers
 // -----------------------------------------------------------------------
 
+// Not declared in Winapi.Windows for this RTL version; value per WinUser.h.
+const
+  MWMO_INPUTAVAILABLE = $0004;
+
 // Waits ~Ms milliseconds WITHOUT blocking this thread's message pump.
 // The WH_KEYBOARD_LL hook is serviced by this thread: a plain Sleep here
 // makes Windows hold every keystroke system-wide until the hook timeout,
@@ -262,6 +266,7 @@ end;
 procedure WaitPump(Ms: Cardinal);
 var
   Deadline: UInt64;
+  Remaining: UInt64;
   M: TMsg;
 begin
   Deadline := GetTickCount64 + Ms;
@@ -276,10 +281,11 @@ begin
       TranslateMessage(M);
       DispatchMessage(M);
     end;
-    if GetTickCount64 >= Deadline then
+    Remaining := Deadline - GetTickCount64;
+    if (Remaining = 0) or (Remaining > Ms) then
       Break;
-    MsgWaitForMultipleObjects(0, Pointer(nil)^, False,
-      DWORD(Deadline - GetTickCount64), QS_ALLINPUT);
+    MsgWaitForMultipleObjectsEx(0, Pointer(nil)^, DWORD(Remaining),
+      QS_ALLINPUT, MWMO_INPUTAVAILABLE);
   until False;
 end;
 
