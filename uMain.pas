@@ -11,7 +11,7 @@ uses
   uConverter, System.Classes;
 
 const
-  APP_VERSION         = '1.3.1';
+  APP_VERSION         = '1.3.2';
   WM_CONVERT_LAST     = WM_USER + 10;
   WM_CONVERT_SELECTED = WM_USER + 11;
   WM_SWITCH_LAYOUT    = WM_USER + 12;
@@ -266,7 +266,7 @@ const
 procedure WaitPump(Ms: Cardinal);
 var
   Deadline: UInt64;
-  Remaining: UInt64;
+  Now64: UInt64;
   M: TMsg;
 begin
   Deadline := GetTickCount64 + Ms;
@@ -281,10 +281,13 @@ begin
       TranslateMessage(M);
       DispatchMessage(M);
     end;
-    Remaining := Deadline - GetTickCount64;
-    if (Remaining = 0) or (Remaining > Ms) then
+    // Compare BEFORE subtracting: the deadline is usually already past
+    // here, and an unsigned underflow raises EIntOverflow under $Q+.
+    // Single time sample also avoids a check-then-subtract race.
+    Now64 := GetTickCount64;
+    if Now64 >= Deadline then
       Break;
-    MsgWaitForMultipleObjectsEx(0, Pointer(nil)^, DWORD(Remaining),
+    MsgWaitForMultipleObjectsEx(0, Pointer(nil)^, DWORD(Deadline - Now64),
       QS_ALLINPUT, MWMO_INPUTAVAILABLE);
   until False;
 end;
