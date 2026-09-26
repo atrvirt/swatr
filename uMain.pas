@@ -69,6 +69,9 @@ uses
 
 var
   HookHandle:   HHOOK;
+  MouseHook:    HHOOK;   // any click moves the caret — buffer no longer valid
+  FgEventHook:  THandle; // EVENT_SYSTEM_FOREGROUND — another window activated
+  FocusHook:    THandle; // EVENT_OBJECT_FOCUS — focus moved to another control
   KeyBuffer:    string;
   RCtrlDown:    Boolean;
   Converting:   Boolean; // a conversion is in progress — drop re-triggers
@@ -547,6 +550,28 @@ begin
   Result := CallNextHookEx(HookHandle, nCode, wParam, lParam);
 end;
 
+// Focus left the field the buffer was typed into — forget it, otherwise
+// the next Pause converts stale text from the previous window/control.
+// Out-of-context: delivered through this thread's message loop.
+procedure FocusWinEventProc(hWinEventHook: THandle; event: DWORD; hwnd: HWND;
+  idObject, idChild: Longint; idEventThread, dwmsEventTime: DWORD); stdcall;
+begin
+  KeyBuffer := '';
+end;
+
+// Mouse click — the caret may now be in another field, tab or position.
+// Covers apps that draw their own controls (Chrome tabs/omnibox) and fire
+// no focus WinEvents.
+function LowLevelMouseProc(nCode: Integer; wParam: WPARAM; lParam: LPARAM): LRESULT; stdcall;
+begin
+  if nCode >= 0 then
+    case wParam of
+      WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN, WM_XBUTTONDOWN:
+        KeyBuffer := '';
+    end;
+  Result := CallNextHookEx(MouseHook, nCode, wParam, lParam);
+end;
+
 procedure SwitchFgToLang(LangID: WORD); forward;
 
 // -----------------------------------------------------------------------
@@ -897,6 +922,11 @@ begin
   KeyBuffer  := '';
   RCtrlDown  := False;
   HookHandle := SetWindowsHookEx(WH_KEYBOARD_LL, @LowLevelKeyboardProc, 0, 0);
+  MouseHook  := SetWindowsHookEx(WH_MOUSE_LL, @LowLevelMouseProc, 0, 0);
+  FgEventHook := SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+    0, FocusWinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT or WINEVENT_SKIPOWNPROCESS);
+  FocusHook := SetWinEventHook(EVENT_OBJECT_FOCUS, EVENT_OBJECT_FOCUS,
+    0, FocusWinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT or WINEVENT_SKIPOWNPROCESS);
   AddClipboardFormatListener(Handle);
 
   if HookHandle = 0 then
@@ -908,6 +938,21 @@ procedure TfrmMain.FormDestroy(Sender: TObject);
 begin
   ClipHistory.SaveToFile(HistFile);
   RemoveClipboardFormatListener(Handle);
+  if MouseHook <> 0 then
+  begin
+    UnhookWindowsHookEx(MouseHook);
+    MouseHook := 0;
+  end;
+  if FgEventHook <> 0 then
+  begin
+    UnhookWinEvent(FgEventHook);
+    FgEventHook := 0;
+  end;
+  if FocusHook <> 0 then
+  begin
+    UnhookWinEvent(FocusHook);
+    FocusHook := 0;
+  end;
   if HookHandle <> 0 then
   begin
     UnhookWindowsHookEx(HookHandle);
