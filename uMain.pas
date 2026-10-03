@@ -11,7 +11,7 @@ uses
   uConverter, System.Classes;
 
 const
-  APP_VERSION         = '1.3.3';
+  APP_VERSION         = '1.4.0';
   WM_CONVERT_LAST     = WM_USER + 10;
   WM_CONVERT_SELECTED = WM_USER + 11;
   WM_SWITCH_LAYOUT    = WM_USER + 12;
@@ -41,6 +41,7 @@ type
     procedure miAboutClick(Sender: TObject);
   private
     FCurrentHkl: HKL;
+    FInClipUpdate: Boolean;
     procedure WMConvertLast(var Msg: TMessage);     message WM_CONVERT_LAST;
     procedure WMConvertSelected(var Msg: TMessage); message WM_CONVERT_SELECTED;
     procedure WMSwitchLayout(var Msg: TMessage);    message WM_SWITCH_LAYOUT;
@@ -67,15 +68,105 @@ uses
 // Globals
 // -----------------------------------------------------------------------
 
+// All hooks live on THookThread (see below); hook callbacks run there,
+// message handlers run on the main thread. KeyBuffer is shared by both and
+// is only touched under BufLock.
 var
   HookHandle:   HHOOK;
   MouseHook:    HHOOK;   // any click moves the caret — buffer no longer valid
   FgEventHook:  THandle; // EVENT_SYSTEM_FOREGROUND — another window activated
   FocusHook:    THandle; // EVENT_OBJECT_FOCUS — focus moved to another control
-  KeyBuffer:    string;
-  RCtrlDown:    Boolean;
+  MainWnd:      HWND;    // frmMain.Handle, captured for the hook thread
+  KeyBuffer:    TKeyStrokes; // keys typed since the last caret move
+  ConvMark:     Integer = -1; // start of the segment Pause just converted;
+                              // -1 once anything else touches the buffer
+  BufFocus:     HWND;    // control that had keyboard focus when the last key was buffered
+  BufLock:      TRTLCriticalSection;
+  RCtrlDown:    Boolean; // hook thread only
   Converting:   Boolean; // a conversion is in progress — drop re-triggers
-  PauseDown:    Boolean; // Pause held — ignore auto-repeat keydowns
+  PauseDown:    Boolean; // Pause held — ignore auto-repeat keydowns (hook thread only)
+
+// -----------------------------------------------------------------------
+// Diagnostics: start SwATR with /log to append every key, buffer reset and
+// conversion to %TEMP%\SwATR.log. Off by default (typed text lands in it).
+// -----------------------------------------------------------------------
+
+var
+  LogOn:   Boolean;
+  LogLock: TRTLCriticalSection;
+
+procedure Log(const S: string);
+var
+  FS: TFileStream;
+  Path: string;
+  B: TBytes;
+begin
+  if not LogOn then Exit;
+  EnterCriticalSection(LogLock);
+  try
+    try
+      Path := IncludeTrailingPathDelimiter(GetEnvironmentVariable('TEMP')) +
+        'SwATR.log';
+      if FileExists(Path) then
+        FS := TFileStream.Create(Path, fmOpenWrite or fmShareDenyNone)
+      else
+        FS := TFileStream.Create(Path, fmCreate);
+      try
+        FS.Seek(0, soEnd);
+        B := TEncoding.UTF8.GetBytes(
+          FormatDateTime('hh:nn:ss.zzz', Now) + '  ' + S + #13#10);
+        FS.WriteBuffer(B[0], Length(B));
+      finally
+        FS.Free;
+      end;
+    except
+      // diagnostics must never break input handling
+    end;
+  finally
+    LeaveCriticalSection(LogLock);
+  end;
+end;
+
+function HklStr(Layout: HKL): string;
+begin
+  Result := IntToHex(NativeUInt(Layout), 8);
+end;
+
+// Control that really has keyboard focus in the foreground window
+// (falls back to the foreground window itself)
+function RealFocus: HWND;
+var
+  Fg: HWND;
+  GTI: TGUIThreadInfo;
+begin
+  Fg := GetForegroundWindow;
+  Result := 0;
+  FillChar(GTI, SizeOf(GTI), 0);
+  GTI.cbSize := SizeOf(GTI);
+  if GetGUIThreadInfo(GetWindowThreadProcessId(Fg, nil), GTI) then
+    Result := GTI.hwndFocus;
+  if Result = 0 then
+    Result := Fg;
+end;
+
+function WndClass(Wnd: HWND): string;
+var
+  Buf: array[0..127] of Char;
+begin
+  SetString(Result, Buf, GetClassName(Wnd, Buf, Length(Buf)));
+end;
+
+procedure BufClear(const Why: string);
+begin
+  EnterCriticalSection(BufLock);
+  try
+    KeyBuffer := nil;
+    ConvMark  := -1;
+  finally
+    LeaveCriticalSection(BufLock);
+  end;
+  Log('clear: ' + Why);
+end;
 
 // -----------------------------------------------------------------------
 // Layout helpers
@@ -262,10 +353,9 @@ end;
 const
   MWMO_INPUTAVAILABLE = $0004;
 
-// Waits ~Ms milliseconds WITHOUT blocking this thread's message pump.
-// The WH_KEYBOARD_LL hook is serviced by this thread: a plain Sleep here
-// makes Windows hold every keystroke system-wide until the hook timeout,
-// then bypass (and eventually silently remove) the hook.
+// Waits ~Ms milliseconds WITHOUT blocking this thread's message pump,
+// so the tray, toast and clipboard listener stay responsive during
+// conversions. (The LL hooks run on THookThread and are not affected.)
 procedure WaitPump(Ms: Cardinal);
 var
   Deadline: UInt64;
@@ -408,24 +498,24 @@ begin
 end;
 
 // -----------------------------------------------------------------------
-// Character buffer helper
+// Key buffer helper
 // -----------------------------------------------------------------------
 
-function VkToChar(vk, scan: UINT): WideChar;
-var
-  KS: TKeyboardState;
-  Buf: array[0..3] of WideChar;
+// Records the key with its modifiers and the layout it was typed in.
+// Modifier state is read asynchronously: GetKeyboardState reads the calling
+// thread's state, and this thread never has keyboard focus.
+function MakeKeyStroke(vk, scan: UINT; AltGr: Boolean): TKeyStroke;
 begin
-  Result := #0;
-  // Build KS from async state: GetKeyboardState reads the calling thread's
-  // state, which in a LL hook is SwATR's thread — Shift is not reflected there.
-  ZeroMemory(@KS, SizeOf(KS));
-  if (GetAsyncKeyState(VK_SHIFT)   and $8000) <> 0 then KS[VK_SHIFT]   := $80;
+  FillChar(Result, SizeOf(Result), 0);
+  Result.Vk    := vk;
+  Result.Scan  := scan;
+  Result.Shift := (GetAsyncKeyState(VK_SHIFT) and $8000) <> 0;
   // Toggle state: low bit of GetKeyState. GetAsyncKeyState's low bit is
   // "pressed since last call", not the toggle.
-  if (GetKeyState(VK_CAPITAL) and 1) <> 0 then KS[VK_CAPITAL] := $01;
-  if ToUnicodeEx(vk, scan, KS, Buf, 4, 0, GetFgHkl) = 1 then
-    Result := Buf[0];
+  Result.Caps  := (GetKeyState(VK_CAPITAL) and 1) <> 0;
+  Result.AltGr := AltGr;
+  Result.Hkl   := GetFgHkl;
+  Result.Ch    := KeyToChar(Result, Result.Hkl);
 end;
 
 // -----------------------------------------------------------------------
@@ -435,8 +525,9 @@ end;
 function LowLevelKeyboardProc(nCode: Integer; wParam: WPARAM; lParam: LPARAM): LRESULT; stdcall;
 var
   KHS: PKbdllHookStruct;
-  IsCtrl, IsAlt: Boolean;
-  Ch: WideChar;
+  IsCtrl, IsAlt, AltGr: Boolean;
+  K: TKeyStroke;
+  What: string;
 begin
   Result := 0;
 
@@ -462,7 +553,7 @@ begin
     else if (wParam = WM_KEYUP) and RCtrlDown then
     begin
       RCtrlDown := False;
-      PostMessage(frmMain.Handle, WM_SWITCH_LAYOUT, 0, 0);
+      PostMessage(MainWnd, WM_SWITCH_LAYOUT, 0, 0);
     end;
     Result := 1; // always consume RCtrl
     Exit;
@@ -486,7 +577,7 @@ begin
     // ---- Ctrl+` : clipboard history ----
     if (KHS^.vkCode = $C0) and IsCtrl then
     begin
-      PostMessage(frmMain.Handle, WM_SHOW_HISTORY,
+      PostMessage(MainWnd, WM_SHOW_HISTORY,
         0, NativeInt(GetForegroundWindow));
       Result := 1;
       Exit;
@@ -500,12 +591,15 @@ begin
       if not PauseDown then
       begin
         PauseDown := True;
+        if LogOn then
+          Log(Format('pause pressed shift=%d converting=%d',
+            [Ord((GetAsyncKeyState(VK_SHIFT) and $8000) <> 0), Ord(Converting)]));
         if not Converting then
         begin
           if (GetAsyncKeyState(VK_SHIFT) and $8000) <> 0 then
-            PostMessage(frmMain.Handle, WM_CONVERT_SELECTED, 0, 0)
+            PostMessage(MainWnd, WM_CONVERT_SELECTED, 0, 0)
           else
-            PostMessage(frmMain.Handle, WM_CONVERT_LAST, 0, 0);
+            PostMessage(MainWnd, WM_CONVERT_LAST, 0, 0);
         end;
       end;
       Result := 1;
@@ -513,37 +607,77 @@ begin
     end;
 
     // ---- Buffer tracking ----
-    if IsCtrl or IsAlt then
-      KeyBuffer := ''
-    else
-    begin
+    // AltGr arrives as LCtrl+RAlt; it types characters (e.g. ґ), so it must
+    // not reset the buffer like a Ctrl/Alt shortcut does.
+    AltGr := (GetAsyncKeyState(VK_RMENU) and $8000) <> 0;
+    What := 'modifier';
+    FillChar(K, SizeOf(K), 0);
+    EnterCriticalSection(BufLock);
+    try
       case KHS^.vkCode of
-        VK_BACK:
-          if Length(KeyBuffer) > 0 then
-            Delete(KeyBuffer, Length(KeyBuffer), 1);
-
-        VK_SPACE:
-          KeyBuffer := KeyBuffer + ' '; // accumulate spaces between words
-
-        VK_RETURN, VK_TAB, VK_ESCAPE,
-        VK_DELETE, VK_INSERT,
-        VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN,
-        VK_HOME, VK_END, VK_PRIOR, VK_NEXT:
-          KeyBuffer := '';
-
+        // Modifiers and non-text keys: buffer unchanged
         VK_SHIFT, VK_CONTROL, VK_MENU,
+        VK_LSHIFT, VK_RSHIFT, VK_LCONTROL, VK_LMENU, VK_RMENU,
         VK_LWIN, VK_RWIN, VK_APPS,
         VK_CAPITAL, VK_NUMLOCK, VK_SCROLL, VK_SNAPSHOT,
         VK_F1..VK_F24:
           ;
 
+        VK_BACK:
+          begin
+            if Length(KeyBuffer) > 0 then
+              SetLength(KeyBuffer, Length(KeyBuffer) - 1);
+            ConvMark := -1;
+            What := 'backspace';
+          end;
+
+        VK_RETURN, VK_TAB, VK_ESCAPE,
+        VK_DELETE, VK_INSERT,
+        VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN,
+        VK_HOME, VK_END, VK_PRIOR, VK_NEXT:
+          begin
+            KeyBuffer := nil;
+            ConvMark  := -1;
+            What := 'reset: navigation';
+          end;
+
         else
-        begin
-          Ch := VkToChar(KHS^.vkCode, KHS^.scanCode);
-          if Ord(Ch) >= 32 then
-            KeyBuffer := KeyBuffer + Ch;
-        end;
+          if (IsCtrl or IsAlt) and not AltGr then
+          begin
+            KeyBuffer := nil; // shortcut — caret/selection state unknown
+            ConvMark  := -1;
+            What := 'reset: shortcut';
+          end
+          else
+          begin
+            K := MakeKeyStroke(KHS^.vkCode, KHS^.scanCode, AltGr);
+            if K.Ch <> #0 then
+            begin
+              SetLength(KeyBuffer, Length(KeyBuffer) + 1);
+              KeyBuffer[High(KeyBuffer)] := K;
+              ConvMark := -1;
+              BufFocus := RealFocus;
+              What := 'add';
+            end
+            else if AltGr then
+            begin
+              KeyBuffer := nil; // AltGr+key typing nothing = Alt shortcut
+              ConvMark  := -1;
+              What := 'reset: AltGr shortcut';
+            end
+            else
+              What := 'ignored: no char';
+            // other keys without a character (media, dead keys): ignored
+          end;
       end;
+      if LogOn then
+        Log(Format('key vk=%.2x sc=%.2x ctrl=%d alt=%d altgr=%d shift=%d caps=%d ' +
+          'hkl=%s ch=%.4x  %s  buf=%d',
+          [KHS^.vkCode, KHS^.scanCode, Ord(IsCtrl), Ord(IsAlt), Ord(AltGr),
+           Ord(K.Shift), Ord(K.Caps), HklStr(K.Hkl), Ord(K.Ch), What,
+           Length(KeyBuffer)]));
+    finally
+      LeaveCriticalSection(BufLock);
     end;
   end;
 
@@ -552,11 +686,49 @@ end;
 
 // Focus left the field the buffer was typed into — forget it, otherwise
 // the next Pause converts stale text from the previous window/control.
-// Out-of-context: delivered through this thread's message loop.
-procedure FocusWinEventProc(hWinEventHook: THandle; event: DWORD; hwnd: HWND;
+// Out-of-context: delivered through the hook thread's message loop.
+procedure FocusWinEventProc(hWinEventHook: THandle; event: DWORD; EvWnd: HWND;
   idObject, idChild: Longint; idEventThread, dwmsEventTime: DWORD); stdcall;
+var
+  Cur, Was: HWND;
+  Kind: string;
 begin
-  KeyBuffer := '';
+  if event = EVENT_SYSTEM_FOREGROUND then
+  begin
+    Kind := 'foreground';
+    // Win+Space layout picker briefly takes the foreground; the caret stays
+    // in the field, so the typed buffer is still valid
+    if WndClass(EvWnd) = 'Input Flyout' then
+    begin
+      Log('foreground ignored: ' + IntToHex(EvWnd, 8) + ' Input Flyout');
+      Exit;
+    end;
+  end
+  else
+    Kind := 'focus';
+
+  // Helper popups fire EVENT_OBJECT_FOCUS after every keystroke while the
+  // caret never leaves the field (Notepad++ autocomplete ListBox: a new
+  // hwnd per key, ~50 ms after it). Likewise the foreground returns to the
+  // same field after the Win+Space picker closes. Trust the real keyboard
+  // focus, not the event.
+  Cur := RealFocus;
+  EnterCriticalSection(BufLock);
+  try
+    Was := BufFocus;
+  finally
+    LeaveCriticalSection(BufLock);
+  end;
+  if (Was <> 0) and (Cur = Was) then
+  begin
+    if LogOn then
+      Log(Kind + ' event ignored: ' + IntToHex(EvWnd, 8) + ' ' + WndClass(EvWnd) +
+        ', keyboard focus still ' + IntToHex(Cur, 8) + ' ' + WndClass(Cur));
+    Exit;
+  end;
+  BufClear(Kind + ' ' + IntToHex(EvWnd, 8) + ' ' + WndClass(EvWnd) +
+    ', keyboard focus ' + IntToHex(Was, 8) + ' -> ' + IntToHex(Cur, 8) +
+    ' ' + WndClass(Cur));
 end;
 
 // Mouse click — the caret may now be in another field, tab or position.
@@ -567,48 +739,206 @@ begin
   if nCode >= 0 then
     case wParam of
       WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN, WM_XBUTTONDOWN:
-        KeyBuffer := '';
+        BufClear('mouse click');
     end;
   Result := CallNextHookEx(MouseHook, nCode, wParam, lParam);
 end;
 
-procedure SwitchFgToLang(LangID: WORD); forward;
+// -----------------------------------------------------------------------
+// Hook thread
+// -----------------------------------------------------------------------
+
+// Owns every hook. LL hooks are called on the installing thread's message
+// loop; when they lived on the GUI thread, any slow work there (large
+// clipboard bitmaps, modal forms, history load) could exceed
+// LowLevelHooksTimeout — Windows then stalls input and silently removes the
+// hook. This thread does nothing but pump messages, so that cannot happen.
+type
+  THookThread = class(TThread)
+  private
+    FReady:     THandle; // signalled once hooks are installed (or failed)
+    FHookError: DWORD;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    procedure AfterConstruction; override;
+    procedure Stop;
+    property HookError: DWORD read FHookError;
+  end;
+
+var
+  HookThread: THookThread;
+
+// The RTL starts the thread in AfterConstruction (calling Start inside the
+// constructor raises EThread), so the constructor only prepares state.
+constructor THookThread.Create;
+begin
+  inherited Create(False);
+  FreeOnTerminate := False;
+  FReady := CreateEvent(nil, True, False, nil);
+  Priority := tpHigher;
+end;
+
+procedure THookThread.AfterConstruction;
+begin
+  inherited; // starts the thread
+  WaitForSingleObject(FReady, 5000);
+end;
+
+destructor THookThread.Destroy;
+begin
+  CloseHandle(FReady);
+  inherited;
+end;
+
+procedure THookThread.Execute;
+var
+  M: TMsg;
+begin
+  // Create this thread's message queue before signalling ready, so the
+  // WM_QUIT posted by Stop can never be lost.
+  PeekMessage(M, 0, WM_USER, WM_USER, PM_NOREMOVE);
+
+  HookHandle := SetWindowsHookEx(WH_KEYBOARD_LL, @LowLevelKeyboardProc, 0, 0);
+  if HookHandle = 0 then
+    FHookError := GetLastError;
+  MouseHook  := SetWindowsHookEx(WH_MOUSE_LL, @LowLevelMouseProc, 0, 0);
+  FgEventHook := SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+    0, FocusWinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT or WINEVENT_SKIPOWNPROCESS);
+  FocusHook := SetWinEventHook(EVENT_OBJECT_FOCUS, EVENT_OBJECT_FOCUS,
+    0, FocusWinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT or WINEVENT_SKIPOWNPROCESS);
+  SetEvent(FReady);
+
+  while Integer(GetMessage(M, 0, 0, 0)) > 0 do
+  begin
+    TranslateMessage(M);
+    DispatchMessage(M);
+  end;
+
+  // Unhook on the installing thread (required for UnhookWinEvent)
+  if FocusHook <> 0 then
+  begin
+    UnhookWinEvent(FocusHook);
+    FocusHook := 0;
+  end;
+  if FgEventHook <> 0 then
+  begin
+    UnhookWinEvent(FgEventHook);
+    FgEventHook := 0;
+  end;
+  if MouseHook <> 0 then
+  begin
+    UnhookWindowsHookEx(MouseHook);
+    MouseHook := 0;
+  end;
+  if HookHandle <> 0 then
+  begin
+    UnhookWindowsHookEx(HookHandle);
+    HookHandle := 0;
+  end;
+end;
+
+procedure THookThread.Stop;
+begin
+  PostThreadMessage(ThreadID, WM_QUIT, 0, 0);
+  WaitFor;
+end;
+
+procedure SwitchFgToHkl(Target: HKL); forward;
 
 // -----------------------------------------------------------------------
 // Message handlers
 // -----------------------------------------------------------------------
 
-// Pause — convert last typed word
+// Pause — re-type the last keys in the other layout.
+// Only the trailing run typed in ONE layout is converted: if the user
+// switched layout mid-buffer, the earlier part was typed on purpose.
+// Pressed again right after a conversion, it converts exactly that segment
+// back (undo), even though it now merges with same-layout text before it.
 procedure TfrmMain.WMConvertLast(var Msg: TMessage);
 var
-  Buf, Conv: string;
+  Keys: TKeyStrokes;
+  Mark, Start, I: Integer;
+  Src, Target, CyrHint: HKL;
+  OldText, NewText: string;
+  C: WideChar;
   Inp: array of TInput;
   Idx: Integer;
 begin
   if Converting then Exit;
   Converting := True;
   try
-    Buf := KeyBuffer;
-    KeyBuffer := '';
-    if Buf = '' then Exit;
-    Conv := ConvertText(Buf);
-    if Conv = Buf then Exit;
+    EnterCriticalSection(BufLock);
+    try
+      Keys := Copy(KeyBuffer);
+      Mark := ConvMark;
+    finally
+      LeaveCriticalSection(BufLock);
+    end;
+    if Length(Keys) = 0 then
+    begin
+      Log('pause: buffer empty');
+      Exit;
+    end;
 
-    SetLength(Inp, (Length(Buf) + Length(Conv)) * 2);
+    Src := Keys[High(Keys)].Hkl;
+    if (Mark >= 0) and (Mark <= High(Keys)) then
+      Start := Mark
+    else
+    begin
+      Start := High(Keys);
+      while (Start > 0) and (Keys[Start - 1].Hkl = Src) do
+        Dec(Start);
+    end;
+
+    // Latin -> which Cyrillic layout: the one used earlier in the buffer,
+    // else Ukrainian (see OtherLayout)
+    CyrHint := 0;
+    for I := 0 to High(Keys) do
+      if not IsLatinLayout(Keys[I].Hkl) then
+        CyrHint := Keys[I].Hkl;
+    Target := OtherLayout(Src, CyrHint);
+    if Target = 0 then
+    begin
+      Log('pause: no target layout for ' + HklStr(Src));
+      Exit;
+    end;
+
+    OldText := '';
+    NewText := '';
+    for I := Start to High(Keys) do
+    begin
+      OldText := OldText + Keys[I].Ch;
+      C := KeyToChar(Keys[I], Target);
+      if C = #0 then
+        C := Keys[I].Ch; // key types nothing in Target — keep it
+      Keys[I].Ch  := C;
+      Keys[I].Hkl := Target;
+      NewText := NewText + C;
+    end;
+    Log(Format('pause: "%s" -> "%s"  %s -> %s  start=%d mark=%d len=%d',
+      [OldText, NewText, HklStr(Src), HklStr(Target), Start, Mark, Length(Keys)]));
+    if NewText = OldText then Exit;
+
+    SetLength(Inp, (Length(OldText) + Length(NewText)) * 2);
     Idx := 0;
-    FillBackspaces(Length(Buf), Inp, Idx);
-    FillUnicodeText(Conv, Inp, Idx);
+    FillBackspaces(Length(OldText), Inp, Idx);
+    FillUnicodeText(NewText, Inp, Idx);
     SendInput(Idx, Inp[0], SizeOf(TInput));
 
-    KeyBuffer := Conv;
+    EnterCriticalSection(BufLock);
+    try
+      KeyBuffer := Keys;
+      ConvMark  := Start;
+    finally
+      LeaveCriticalSection(BufLock);
+    end;
 
-    // Switch layout to match the converted text
-    if IsUkrText(Conv) then
-      SwitchFgToLang($0422)   // Ukrainian
-    else
-      SwitchFgToLang($0409);  // English (US)
+    SwitchFgToHkl(Target);
 
-    ShowToast(Buf + ' '#$2192' ' + Conv);
+    ShowToast(OldText + ' '#$2192' ' + NewText);
   finally
     Converting := False;
   end;
@@ -650,6 +980,77 @@ begin
       Exit; // opened OK — don't retry even if empty
     end;
     WaitPump(30); // clipboard busy — wait and retry
+  end;
+end;
+
+// Reads CF_DIB (Windows synthesizes it from CF_BITMAP) into Bmp. The DIB is
+// copied out and the clipboard closed before decoding, so the source app is
+// blocked as briefly as possible. No VCL Clipboard: it raises
+// EClipboardException whenever another process holds the clipboard.
+function ClipGetBitmap(Bmp: TBitmap): Boolean;
+var
+  Tries: Integer;
+  hData: THandle;
+  pData: Pointer;
+  Bih: PBitmapInfoHeader;
+  Bfh: TBitmapFileHeader;
+  Colors, Off: Cardinal;
+  MS: TMemoryStream;
+begin
+  Result := False;
+  MS := TMemoryStream.Create;
+  try
+    for Tries := 1 to 8 do
+    begin
+      if OpenClipboard(0) then
+      begin
+        try
+          hData := GetClipboardData(CF_DIB);
+          if hData <> 0 then
+          begin
+            pData := GlobalLock(hData);
+            if pData <> nil then
+            try
+              Bih := PBitmapInfoHeader(pData);
+              // Pixel data offset = file header + info header
+              // (+ 3 masks for BI_BITFIELDS) + color table
+              Off := SizeOf(TBitmapFileHeader) + Bih^.biSize;
+              if (Bih^.biSize = SizeOf(TBitmapInfoHeader)) and
+                 (Bih^.biCompression = BI_BITFIELDS) then
+                Inc(Off, 3 * SizeOf(DWORD));
+              Colors := Bih^.biClrUsed;
+              if (Colors = 0) and (Bih^.biBitCount <= 8) then
+                Colors := 1 shl Bih^.biBitCount;
+              Inc(Off, Colors * SizeOf(TRGBQuad));
+
+              FillChar(Bfh, SizeOf(Bfh), 0);
+              Bfh.bfType    := $4D42; // 'BM'
+              Bfh.bfSize    := SizeOf(Bfh) + GlobalSize(hData);
+              Bfh.bfOffBits := Off;
+              MS.WriteBuffer(Bfh, SizeOf(Bfh));
+              MS.WriteBuffer(pData^, GlobalSize(hData));
+            finally
+              GlobalUnlock(hData);
+            end;
+          end;
+        finally
+          CloseClipboard;
+        end;
+        Break; // opened OK — don't retry even if no bitmap
+      end;
+      WaitPump(30); // clipboard busy — wait and retry
+    end;
+
+    if MS.Size = 0 then Exit;
+    MS.Position := 0;
+    try
+      Bmp.LoadFromStream(MS);
+      Result := (Bmp.Width > 0) and (Bmp.Height > 0);
+    except
+      // Unsupported DIB variant (e.g. JPEG/PNG-compressed) — skip it
+    end;
+  finally
+    MS.Free;
   end;
 end;
 
@@ -700,11 +1101,12 @@ end;
 procedure TfrmMain.WMConvertSelected(var Msg: TMessage);
 var
   Sel, Conv: string;
+  Target: HKL;
 begin
   if Converting then Exit;
   Converting := True;
   try
-    KeyBuffer := '';
+    BufClear('shift+pause');
 
     // Wait for the user to physically release Shift (held from
     // Shift+Pause); if still held after 400 ms, release it synthetically
@@ -720,17 +1122,14 @@ begin
     if not ClipGetText(Sel) then Exit;
     if Sel = '' then Exit;
 
-    Conv := ConvertText(Sel);
-    if Conv = Sel then Exit;
+    Conv := ConvertSelection(Sel, GetFgHkl, Target);
+    if (Target = 0) or (Conv = Sel) then Exit;
 
     ClipSetText(Conv);
     SendCtrlKey(Ord('V'));
 
-    // Switch layout to match the converted text
-    if IsUkrText(Conv) then
-      SwitchFgToLang($0422)
-    else
-      SwitchFgToLang($0409);
+    // Switch to the layout the last converted word ended up in
+    SwitchFgToHkl(Target);
 
     ShowToast(IntToStr(Length(Sel)) + ' ' +
       #1089#1080#1084#1074#1086#1083#1110#1074 + ' ' +
@@ -740,28 +1139,14 @@ begin
   end;
 end;
 
-// Switch foreground window to a specific language (by LANGID, e.g. $0422=UA, $0409=EN)
-// Silently skips if that layout is not installed.
-procedure SwitchFgToLang(LangID: WORD);
+// Switch the foreground window to an exact installed layout (HKL, not just
+// the language — so Ukrainian Enhanced does not fall back to Ukrainian).
+procedure SwitchFgToHkl(Target: HKL);
 var
-  FgWnd:   HWND;
-  Buf:     array[0..31] of HKL;
-  Cnt, I:  Integer;
-  Target:  HKL;
+  FgWnd: HWND;
 begin
   FgWnd := GetForegroundWindow;
-  if FgWnd = 0 then Exit;
-
-  Cnt := GetKeyboardLayoutList(32, Buf[0]);
-  Target := 0;
-  for I := 0 to Cnt - 1 do
-    if WORD(NativeUInt(Buf[I]) and $FFFF) = LangID then
-    begin
-      Target := Buf[I];
-      Break;
-    end;
-
-  if Target = 0 then Exit;
+  if (FgWnd = 0) or (Target = 0) then Exit;
 
   // Same mechanism as WMSwitchLayout (RCtrl): DefWindowProc handles
   // WM_INPUTLANGCHANGEREQUEST by activating the layout in the target thread.
@@ -808,6 +1193,14 @@ var
   Txt: string;
   Bmp: TBitmap;
 begin
+  // Our own paste from the history popup — item was already moved to top
+  if GetClipboardSequenceNumber = IgnoreClipSeq then Exit;
+  // Clipboard retries pump messages and may dispatch the next update
+  // re-entrantly; the outer call reads the latest content anyway.
+  if FInClipUpdate then Exit;
+  FInClipUpdate := True;
+  try
+
   if IsClipboardFormatAvailable(CF_UNICODETEXT) then
   begin
     if ClipGetText(Txt) and (Txt <> '') then
@@ -824,14 +1217,15 @@ begin
   begin
     Bmp := TBitmap.Create;
     try
-      try
-        Bmp.Assign(Clipboard);
-        if (Bmp.Width > 0) and (Bmp.Height > 0) then
-          ClipHistory.PushBitmap(Bmp);
-      except end;
+      if ClipGetBitmap(Bmp) then
+        ClipHistory.PushBitmap(Bmp);
     finally
       Bmp.Free;
     end;
+  end;
+
+  finally
+    FInClipUpdate := False;
   end;
 end;
 
@@ -884,6 +1278,21 @@ begin
   Params.ExStyle := (Params.ExStyle or WS_EX_TOOLWINDOW) and not WS_EX_APPWINDOW;
 end;
 
+// Log header: version, real OS build, ToUnicodeEx flags, installed layouts
+function StartupInfo: string;
+var
+  Buf: array[0..31] of HKL;
+  N, I: Integer;
+begin
+  Result := 'start SwATR v' + APP_VERSION + '  ' + TOSVersion.ToString +
+    '  tuflags=' + IntToStr(ToUnicodeFlags) + '  layouts:';
+  N := GetKeyboardLayoutList(Length(Buf), Buf[0]);
+  for I := 0 to N - 1 do
+    Result := Result + ' ' + HklStr(Buf[I]);
+  if HookHandle = 0 then
+    Result := Result + '  KEYBOARD HOOK FAILED';
+end;
+
 procedure TfrmMain.FormCreate(Sender: TObject);
 var
   Tmr:    TTimer;
@@ -919,45 +1328,28 @@ begin
   Tmr.OnTimer  := OnLayoutTimer;
   Tmr.Enabled  := True;
 
-  KeyBuffer  := '';
+  BufClear('start');
   RCtrlDown  := False;
-  HookHandle := SetWindowsHookEx(WH_KEYBOARD_LL, @LowLevelKeyboardProc, 0, 0);
-  MouseHook  := SetWindowsHookEx(WH_MOUSE_LL, @LowLevelMouseProc, 0, 0);
-  FgEventHook := SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
-    0, FocusWinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT or WINEVENT_SKIPOWNPROCESS);
-  FocusHook := SetWinEventHook(EVENT_OBJECT_FOCUS, EVENT_OBJECT_FOCUS,
-    0, FocusWinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT or WINEVENT_SKIPOWNPROCESS);
+  MainWnd    := Handle;   // before the hook thread starts posting to it
+  HookThread := THookThread.Create;
+  if LogOn then
+    Log(StartupInfo);
   AddClipboardFormatListener(Handle);
 
   if HookHandle = 0 then
-    MessageBox(0, PChar('Hook error: ' + SysErrorMessage(GetLastError)),
+    MessageBox(0, PChar('Hook error: ' + SysErrorMessage(HookThread.HookError)),
       'SwATR', MB_OK or MB_ICONERROR);
 end;
 
 procedure TfrmMain.FormDestroy(Sender: TObject);
 begin
+  if HookThread <> nil then
+  begin
+    HookThread.Stop;
+    FreeAndNil(HookThread);
+  end;
   ClipHistory.SaveToFile(HistFile);
   RemoveClipboardFormatListener(Handle);
-  if MouseHook <> 0 then
-  begin
-    UnhookWindowsHookEx(MouseHook);
-    MouseHook := 0;
-  end;
-  if FgEventHook <> 0 then
-  begin
-    UnhookWinEvent(FgEventHook);
-    FgEventHook := 0;
-  end;
-  if FocusHook <> 0 then
-  begin
-    UnhookWinEvent(FocusHook);
-    FocusHook := 0;
-  end;
-  if HookHandle <> 0 then
-  begin
-    UnhookWindowsHookEx(HookHandle);
-    HookHandle := 0;
-  end;
   TrayIcon1.Visible := False;
 end;
 
@@ -1146,5 +1538,14 @@ begin
   TrayIcon1.Visible := False;
   Application.Terminate;
 end;
+
+initialization
+  InitializeCriticalSection(BufLock);
+  InitializeCriticalSection(LogLock);
+  LogOn := FindCmdLineSwitch('log');
+
+finalization
+  DeleteCriticalSection(LogLock);
+  DeleteCriticalSection(BufLock);
 
 end.

@@ -10,6 +10,7 @@ uses
 const
   MAX_CLIP_ITEMS = 64;
   MAX_SAVE_ITEMS = 64;
+  MAX_CLIP_BITMAPS = 5; // bitmaps are uncompressed (~6 MB per Full HD shot)
 
 type
   TClipKind = (ckText, ckBitmap);
@@ -37,6 +38,7 @@ type
     procedure PushText(const S: string);
     procedure PushBitmap(Bmp: TBitmap);
     procedure Delete(Idx: Integer);
+    procedure MoveToTop(Item: TClipItem);
     procedure Clear;
     procedure SaveToFile(const FileName: string);
     procedure LoadFromFile(const FileName: string);
@@ -46,6 +48,9 @@ type
 
 var
   ClipHistory: TClipHistory;
+  // GetClipboardSequenceNumber right after the history popup put an item on
+  // the clipboard: that change must not be captured again as a new entry.
+  IgnoreClipSeq: DWORD = 0;
 
 implementation
 
@@ -145,21 +150,23 @@ end;
 
 procedure TClipHistory.PushBitmap(Bmp: TBitmap);
 var
-  I: Integer;
-  Old: TClipItem;
+  I, BmpCount: Integer;
 begin
-  // Dedup by dimensions — move existing match to top instead of adding duplicate
-  for I := FList.Count - 1 downto 0 do
-  begin
-    Old := TClipItem(FList[I]);
-    if (Old.Kind = ckBitmap) and
-       (Old.Bmp.Width = Bmp.Width) and (Old.Bmp.Height = Bmp.Height) then
+  // Keep at most MAX_CLIP_BITMAPS: drop the oldest bitmaps (FList[0] = oldest)
+  BmpCount := 0;
+  for I := 0 to FList.Count - 1 do
+    if TClipItem(FList[I]).Kind = ckBitmap then
+      Inc(BmpCount);
+  I := 0;
+  while (BmpCount >= MAX_CLIP_BITMAPS) and (I < FList.Count) do
+    if TClipItem(FList[I]).Kind = ckBitmap then
     begin
-      Old.Free;
+      TClipItem(FList[I]).Free;
       FList.Delete(I);
-      Break;
-    end;
-  end;
+      Dec(BmpCount);
+    end
+    else
+      Inc(I);
   while FList.Count >= MAX_CLIP_ITEMS do
   begin
     TClipItem(FList[0]).Free;
@@ -178,6 +185,15 @@ begin
     TClipItem(FList[RealIdx]).Free;
     FList.Delete(RealIdx);
   end;
+end;
+
+procedure TClipHistory.MoveToTop(Item: TClipItem);
+var
+  I: Integer;
+begin
+  I := FList.IndexOf(Item);
+  if I >= 0 then
+    FList.Move(I, FList.Count - 1); // last = newest
 end;
 
 procedure TClipHistory.Clear;

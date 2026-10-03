@@ -29,7 +29,9 @@ type
     procedure Reload(const Filter: string = '');
     procedure ShowPreview;
     procedure DoPaste;
+    procedure PasteAt(Idx: Integer);
     procedure DoDelete;
+    procedure OnListKeyPress(Sender: TObject; var Key: Char);
     procedure OnSearch(Sender: TObject);
     procedure OnListClick(Sender: TObject);
     procedure OnListDblClick(Sender: TObject);
@@ -42,6 +44,8 @@ type
     procedure OnFormKeyDown(Sender: TObject; var Key: Word; Shift: TShiftState);
     procedure OnFormActivate(Sender: TObject);
     procedure OnFormDeactivate(Sender: TObject);
+    procedure OnFormShow(Sender: TObject);
+    procedure WMForceForeground(var Msg: TMessage); message WM_USER + 1;
   public
     constructor Create(APrevFgWnd: HWND); reintroduce;
   end;
@@ -52,6 +56,18 @@ var
 procedure ShowClipHistory(PrevFgWnd: HWND);
 
 implementation
+
+// Quick-paste numbering of visible items: 1..9 -> 0..8, 0 -> 9 (tenth).
+// Returns -1 for any other key.
+function DigitIndex(Key: Word): Integer;
+begin
+  case Key of
+    Ord('1')..Ord('9'):     Result := Key - Ord('1');
+    VK_NUMPAD1..VK_NUMPAD9: Result := Key - VK_NUMPAD1;
+    Ord('0'), VK_NUMPAD0:   Result := 9;
+    else                    Result := -1;
+  end;
+end;
 
 // Paste into previous window via SendInput (no dependency on uMain)
 procedure DoCtrlV;
@@ -99,7 +115,7 @@ var
   VSplit: TSplitter;
 begin
   // Form
-  Caption      := 'SwATR — ' + #1073#1091#1092#1077#1088 + ' ' + #1086#1073#1084#1110#1085#1091;
+  Caption      := 'SwATR '#$2014' ' +#1073#1091#1092#1077#1088 + ' ' + #1086#1073#1084#1110#1085#1091;
   Width        := 700;
   Height       := 400;
   BorderStyle  := bsSizeable;
@@ -110,6 +126,7 @@ begin
   OnKeyDown    := OnFormKeyDown;
   OnActivate   := OnFormActivate;
   OnDeactivate := OnFormDeactivate;
+  OnShow       := OnFormShow;
 
   // ---- Bottom panel ----
   pnlBottom := TPanel.Create(Self);
@@ -176,6 +193,7 @@ begin
   lstItems.OnClick     := OnListClick;
   lstItems.OnDblClick  := OnListDblClick;
   lstItems.OnKeyDown   := OnListKeyDown;
+  lstItems.OnKeyPress  := OnListKeyPress;
   lstItems.OnDrawItem  := OnListDrawItem;
 
   // ---- Splitter ----
@@ -266,11 +284,14 @@ begin
   Item := TClipItem(lstItems.Items.Objects[lstItems.ItemIndex]);
   if Item = nil then Exit;
 
-  // Put into clipboard
+  // Put into clipboard; the resulting clipboard update is skipped by the
+  // history listener (IgnoreClipSeq) — the item just moves to the top.
   if Item.Kind = ckText then
     Clipboard.AsText := Item.Text
   else
     Clipboard.Assign(Item.Bmp);
+  IgnoreClipSeq := GetClipboardSequenceNumber;
+  ClipHistory.MoveToTop(Item);
 
   // Restore previous window and paste
   FIgnoreDeactivate := True;
@@ -282,6 +303,14 @@ begin
     DoCtrlV;
   end;
   ModalResult := mrOk;
+end;
+
+// Paste the Idx-th visible item; out-of-range numbers are ignored
+procedure TfrmClipHistory.PasteAt(Idx: Integer);
+begin
+  if (Idx < 0) or (Idx >= lstItems.Count) then Exit;
+  lstItems.ItemIndex := Idx;
+  DoPaste;
 end;
 
 procedure TfrmClipHistory.DoDelete;
@@ -328,11 +357,27 @@ end;
 procedure TfrmClipHistory.OnListKeyDown(Sender: TObject; var Key: Word;
   Shift: TShiftState);
 begin
+  // Plain digit in the list = paste by number (Ctrl+digit is handled
+  // form-wide in OnFormKeyDown)
+  if (Shift = []) and (DigitIndex(Key) >= 0) then
+  begin
+    PasteAt(DigitIndex(Key));
+    Key := 0;
+    Exit;
+  end;
   case Key of
     VK_RETURN: begin Key := 0; DoPaste; end;
     VK_DELETE: begin Key := 0; DoDelete; end;
     else ShowPreview;
   end;
+end;
+
+// Swallow digit chars so the listbox's type-ahead does not jump to an item
+// when the number is out of range
+procedure TfrmClipHistory.OnListKeyPress(Sender: TObject; var Key: Char);
+begin
+  if CharInSet(Key, ['0'..'9']) then
+    Key := #0;
 end;
 
 procedure TfrmClipHistory.OnListDrawItem(Ctrl: TWinControl; Idx: Integer;
@@ -341,6 +386,8 @@ var
   Item:  TClipItem;
   Canv:  TCanvas;
   Thumb: TRect;
+  TxtColor: TColor;
+  X:     Integer;
 begin
   Canv := (Ctrl as TListBox).Canvas;
   if odSelected in St then
@@ -358,14 +405,25 @@ begin
   Item := TClipItem(lstItems.Items.Objects[Idx]);
   if Item = nil then Exit;
 
+  // Quick-paste number (1..9, 0) for the first ten visible items
+  if Idx < 10 then
+  begin
+    TxtColor := Canv.Font.Color;
+    if not (odSelected in St) then
+      Canv.Font.Color := clGrayText;
+    Canv.TextOut(R.Left + 4, R.Top + 2, IntToStr((Idx + 1) mod 10));
+    Canv.Font.Color := TxtColor;
+  end;
+  X := R.Left + 18;
+
   if Item.Kind = ckBitmap then
   begin
-    Thumb := Rect(R.Left + 4, R.Top + 1, R.Left + 16, R.Top + 15);
+    Thumb := Rect(X, R.Top + 1, X + 12, R.Top + 15);
     Canv.StretchDraw(Thumb, Item.Bmp);
-    Canv.TextOut(R.Left + 20, R.Top + 2, Item.Preview);
+    Canv.TextOut(X + 16, R.Top + 2, Item.Preview);
   end
   else
-    Canv.TextOut(R.Left + 4, R.Top + 2, lstItems.Items[Idx]);
+    Canv.TextOut(X, R.Top + 2, lstItems.Items[Idx]);
 end;
 
 procedure TfrmClipHistory.OnBtnPaste(Sender: TObject); begin DoPaste;  end;
@@ -386,6 +444,14 @@ begin
     Key := 0;
     ModalResult := mrCancel;
   end;
+  // Ctrl+digit pastes by number from anywhere, including the search box
+  // (plain digits there are typed into the search)
+  if (Shift = [ssCtrl]) and (DigitIndex(Key) >= 0) then
+  begin
+    PasteAt(DigitIndex(Key));
+    Key := 0;
+    Exit;
+  end;
   // Arrow keys navigate list even when focus is on other controls
   if (Key in [VK_UP, VK_DOWN]) and (lstItems.Count > 0) then
   begin
@@ -397,6 +463,40 @@ end;
 procedure TfrmClipHistory.OnFormActivate(Sender: TObject);
 begin
   FIgnoreDeactivate := False;
+end;
+
+// OnShow fires before the window is actually visible — activate it from a
+// posted message once ShowModal has displayed it.
+procedure TfrmClipHistory.OnFormShow(Sender: TObject);
+begin
+  PostMessage(Handle, WM_USER + 1, 0, 0);
+end;
+
+// Ctrl+` is swallowed by the LL hook, so the foreground app never got it and
+// SwATR often lacks the right to take the foreground: the popup appears but
+// keystrokes (e.g. quick-paste digits) still go to the previous window.
+// Attaching to the foreground thread's input lifts the foreground lock.
+procedure TfrmClipHistory.WMForceForeground(var Msg: TMessage);
+var
+  FgTid, MyTid: DWORD;
+begin
+  if GetForegroundWindow <> Handle then
+  begin
+    FgTid := GetWindowThreadProcessId(GetForegroundWindow, nil);
+    MyTid := GetCurrentThreadId;
+    if (FgTid <> 0) and (FgTid <> MyTid) and
+       AttachThreadInput(MyTid, FgTid, True) then
+    try
+      BringWindowToTop(Handle);
+      SetForegroundWindow(Handle);
+    finally
+      AttachThreadInput(MyTid, FgTid, False);
+    end
+    else
+      SetForegroundWindow(Handle);
+  end;
+  if lstItems.CanFocus then
+    lstItems.SetFocus;
 end;
 
 procedure TfrmClipHistory.OnFormDeactivate(Sender: TObject);
